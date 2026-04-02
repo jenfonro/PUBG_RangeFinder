@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.21)
 
 project(pubg_rangefinder VERSION 0.1.0 LANGUAGES CXX)
 
+option(PUBG_RANGEFINDER_STATIC_RELEASE "Build static cloud release" OFF)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -24,6 +26,12 @@ set(PROJECT_SOURCES
     src/ui/KeyCaptureLineEdit.cpp
 )
 
+if(PUBG_RANGEFINDER_STATIC_RELEASE)
+    list(APPEND PROJECT_SOURCES
+        src/app/StaticQtPlugins.cpp
+    )
+endif()
+
 set(PROJECT_HEADERS
     src/app/AppController.h
     src/config/UiSettingsDraft.h
@@ -41,6 +49,9 @@ qt_add_executable(pubg_rangefinder
 )
 
 target_include_directories(pubg_rangefinder PRIVATE src)
+target_compile_definitions(pubg_rangefinder PRIVATE
+    $<$<BOOL:${PUBG_RANGEFINDER_STATIC_RELEASE}>:PUBG_RANGEFINDER_STATIC_RELEASE>
+)
 
 target_link_libraries(pubg_rangefinder PRIVATE
     Qt6::Core
@@ -50,6 +61,13 @@ target_link_libraries(pubg_rangefinder PRIVATE
 
 if(WIN32)
     target_link_libraries(pubg_rangefinder PRIVATE user32 dwmapi)
+endif()
+
+if(PUBG_RANGEFINDER_STATIC_RELEASE)
+    qt_import_plugins(pubg_rangefinder
+        INCLUDE
+            Qt6::QWindowsIntegrationPlugin
+    )
 endif()
 
 set_target_properties(pubg_rangefinder PROPERTIES
