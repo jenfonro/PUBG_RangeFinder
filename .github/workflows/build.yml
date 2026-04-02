@@ -1,0 +1,232 @@
+name: PUBG Rangefinder Build
+
+run-name: pubg_rangefinder build ${{ inputs.release_tag }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag to publish, for example v1.0.0
+        required: true
+        type: string
+
+concurrency:
+  group: pubg-rangefinder-build-${{ inputs.release_tag }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  PROJECT_NAME: pubg_rangefinder
+  PROJECT_DIR: .
+  RELEASE_TAG: ${{ inputs.release_tag }}
+  RELEASE_BUILD_VERSION: ${{ inputs.release_tag }}
+  QT_VERSION: 6.8.3
+  QT_SERIES: 6.8
+  QT_STATIC_DIR: D:\qt-static\6.8.3\msvc2022_64_static
+  QT_CACHE_KEY: windows-static-qt-6.8.3-msvc2022-v1
+  RELEASE_EXE_NAME: pubg_rangefinder.exe
+
+jobs:
+  prepare_release:
+    name: prepare-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate release tag
+        uses: actions/github-script@v7
+        env:
+          RELEASE_TAG: ${{ env.RELEASE_TAG }}
+        with:
+          script: |
+            const tag = process.env.RELEASE_TAG || ''
+
+            if (!/^v\d+\.\d+\.\d+$/.test(tag)) {
+              core.setFailed(`release_tag must match vMAJOR.MINOR.PATCH, got: ${tag}`)
+            }
+
+      - name: Create release tag if missing
+        uses: actions/github-script@v7
+        env:
+          RELEASE_TAG: ${{ env.RELEASE_TAG }}
+        with:
+          script: |
+            const tag = process.env.RELEASE_TAG
+            const owner = context.repo.owner
+            const repo = context.repo.repo
+
+            try {
+              await github.rest.git.getRef({ owner, repo, ref: `tags/${tag}` })
+            } catch (e) {
+              if (e.status !== 404) throw e
+              await github.rest.git.createRef({ owner, repo, ref: `refs/tags/${tag}`, sha: context.sha })
+            }
+
+      - name: Ensure release exists
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_TAG }}
+          prerelease: false
+          draft: false
+          body: "Preparing pubg_rangefinder release asset..."
+
+  restore_or_build_static_qt:
+    name: restore-or-build-static-qt
+    runs-on: windows-latest
+    needs: prepare_release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Configure MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Restore static Qt cache
+        id: cache-static-qt
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.QT_STATIC_DIR }}
+          key: ${{ env.QT_CACHE_KEY }}
+
+      - name: Download Qt base source
+        if: steps.cache-static-qt.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $zipPath = Join-Path $env:RUNNER_TEMP "qtbase-everywhere-src-${env:QT_VERSION}.zip"
+          $sourceUrl = "https://download.qt.io/official_releases/qt/${env:QT_SERIES}/${env:QT_VERSION}/submodules/qtbase-everywhere-src-${env:QT_VERSION}.zip"
+          Invoke-WebRequest -Uri $sourceUrl -OutFile $zipPath
+          Expand-Archive -Path $zipPath -DestinationPath $env:RUNNER_TEMP -Force
+
+      - name: Build static Qt
+        if: steps.cache-static-qt.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $sourceDir = Join-Path $env:RUNNER_TEMP "qtbase-everywhere-src-${env:QT_VERSION}"
+          $buildDir = Join-Path $env:RUNNER_TEMP "qtbase-build-static"
+          if (Test-Path $env:QT_STATIC_DIR) {
+            Remove-Item -Recurse -Force $env:QT_STATIC_DIR
+          }
+          if (Test-Path $buildDir) {
+            Remove-Item -Recurse -Force $buildDir
+          }
+          New-Item -ItemType Directory -Path $buildDir -Force | Out-Null
+          Push-Location $buildDir
+          & (Join-Path $sourceDir "configure.bat") `
+            -prefix $env:QT_STATIC_DIR `
+            -static `
+            -release `
+            -nomake examples `
+            -nomake tests `
+            -platform win32-msvc `
+            -qt-zlib `
+            -qt-pcre `
+            -qt-harfbuzz `
+            -qt-libpng `
+            -qt-libjpeg `
+            -schannel `
+            -opensource `
+            -confirm-license
+          if ($LASTEXITCODE -ne 0) { throw "Qt configure failed" }
+          cmake --build . --parallel
+          if ($LASTEXITCODE -ne 0) { throw "Qt static build failed" }
+          cmake --install .
+          if ($LASTEXITCODE -ne 0) { throw "Qt static install failed" }
+          Pop-Location
+
+      - name: Verify static Qt SDK
+        shell: pwsh
+        run: |
+          $qtConfig = Join-Path $env:QT_STATIC_DIR "lib/cmake/Qt6/Qt6Config.cmake"
+          if (!(Test-Path $qtConfig)) {
+            throw "Missing static Qt config: $qtConfig"
+          }
+
+  build_static_app:
+    name: build-static-app
+    runs-on: windows-latest
+    needs: [prepare_release, restore_or_build_static_qt]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Restore static Qt cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.QT_STATIC_DIR }}
+          key: ${{ env.QT_CACHE_KEY }}
+          fail-on-cache-miss: true
+
+      - name: Configure CMake
+        shell: pwsh
+        run: |
+          $qtPrefix = $env:QT_STATIC_DIR
+          $qtConfig = Join-Path $qtPrefix "lib/cmake/Qt6/Qt6Config.cmake"
+          if (!(Test-Path $qtConfig)) {
+            throw "Static Qt config not found: $qtConfig"
+          }
+          cmake -S "${env:PROJECT_DIR}" -B "${env:PROJECT_DIR}/build" -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_PREFIX_PATH="$qtPrefix" `
+            -DPUBG_RANGEFINDER_STATIC_RELEASE=ON
+
+      - name: Build
+        shell: pwsh
+        run: |
+          cmake --build "${env:PROJECT_DIR}/build" --config Release
+
+      - name: Verify release executable
+        shell: pwsh
+        run: |
+          $exePath = Join-Path $env:PROJECT_DIR "build/Release/${env:RELEASE_EXE_NAME}"
+          if (!(Test-Path $exePath)) {
+            throw "Missing build output: $exePath"
+          }
+          echo "ASSET_PATH=$exePath" >> $env:GITHUB_ENV
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          files: ${{ env.ASSET_PATH }}
+          prerelease: false
+          overwrite_files: true
+
+  publish_release:
+    name: publish-release
+    runs-on: ubuntu-latest
+    needs: [prepare_release, build_static_app]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "## Build"
+            echo "- project: ${PROJECT_NAME}"
+            echo "- version: ${RELEASE_BUILD_VERSION}"
+            echo "- commit: $(git rev-parse --short=7 HEAD) ($(git rev-parse HEAD))"
+            echo
+            echo "## Notes"
+            echo "- Static Qt single-exe release build"
+            echo "- Asset is released as ${RELEASE_EXE_NAME}"
+            echo "- Local build.sh remains on the dynamic Qt + windeployqt development flow"
+            echo "- The first static Qt build can be slow; subsequent runs reuse the cached static Qt SDK"
+          } > notes.md
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_TAG }}
+          body_path: notes.md
+          prerelease: false
+          draft: false
